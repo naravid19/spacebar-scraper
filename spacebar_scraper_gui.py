@@ -1,11 +1,15 @@
+
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
 import threading
+import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import datetime
 
+# --- Constants & Configuration ---
 CATEGORIES = {
     "การเมือง (Politics)": "politics",
     "ธุรกิจ (Business)": "business",
@@ -17,297 +21,439 @@ CATEGORIES = {
     "Deep Space (บทความพิเศษ)": "deep-space"
 }
 
-def get_normal_news_links(soup):
-    highlight_header = soup.find("h2", string="เรื่องเด่นประจำวัน")
-    if highlight_header:
-        highlight_block = highlight_header.find_parent("div", class_="w-full")
-        if highlight_block:
-            highlight_block.decompose()
-    news_links = soup.find_all("a", attrs={"aria-label": ["articleLink", "latestArticleLink"]})
-    return news_links
+APP_TITLE = "Spacebar News Scraper Pro"
+App_SIZE = "500x650"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
-def scrape_news(category, start_page, end_page, csv_path, log_func, progress_func, page_progress_func):
-    base_url = "https://spacebar.th"
-    articles = []
-    seen_urls = set()
-    total_scraped = 0
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MyBot/1.0; +https://yourdomain.com/bot)"
-    }
-    page = start_page
-    finished = False
-    total_pages = end_page - start_page + 1 if end_page != 0 else "?"
-    while not finished:
-        # === แสดง label หน้า ===
-        if end_page != 0:
-            page_progress_func(page - start_page + 1, end_page - start_page + 1)
-        else:
-            page_progress_func(page - start_page + 1, "?")
+# --- Logic Layer: Scraper ---
+class SpacebarScraper:
+    def __init__(self, msg_queue):
+        self.msg_queue = msg_queue
+        self.stop_event = threading.Event()
 
-        if end_page != 0 and page > end_page:
-            break
+    def log(self, message):
+        self.msg_queue.put(("LOG", message))
 
-        if page == 1:
-            category_url = f"{base_url}/category/{category}"
-        else:
-            category_url = f"{base_url}/category/{category}/page/{page}"
-        log_func(f"กำลังโหลดหน้า {page}: {category_url}")
+    def progress(self, value, maximum=None):
+        self.msg_queue.put(("PROGRESS", (value, maximum)))
+    
+    def status_update(self, message):
+        self.msg_queue.put(("STATUS", message))
 
-        if end_page != 0:
-            progress_func(page - start_page + 1, end_page - start_page + 1)
+    def done(self, success, summary):
+        self.msg_queue.put(("DONE", (success, summary)))
 
+    def get_normal_news_links(self, soup):
+        # Remove highlight block to avoid duplicates if necessary
+        highlight_header = soup.find("h2", string="เรื่องเด่นประจำวัน")
+        if highlight_header:
+            highlight_block = highlight_header.find_parent("div", class_="w-full")
+            if highlight_block:
+                highlight_block.decompose()
+        # Find all article links
+        news_links = soup.find_all("a", attrs={"aria-label": ["articleLink", "latestArticleLink"]})
+        return news_links
+
+    def run(self, category, start_page, end_page, csv_path):
+        base_url = "https://spacebar.th"
+        articles = []
+        seen_urls = set()
+        total_scraped = 0
+        page = start_page
+        
+        self.log(f"--- เริ่มต้นดึงข้อมูล: {category} (หน้า {start_page} - {end_page if end_page > 0 else 'จนจบ'}) ---")
+        
         try:
-            resp = requests.get(category_url, headers=headers, timeout=10)
-            resp.raise_for_status()
+            with requests.Session() as session:
+                session.headers.update(HEADERS)
+                
+                while not self.stop_event.is_set():
+                    # Check end condition
+                    if end_page != 0 and page > end_page:
+                        break
+
+                    # Update Status
+                    progress_text = f"กำลังดึงรายการข่าว หน้าที่ {page}..."
+                    self.status_update(progress_text)
+                    
+                    # Update Progress Bar (Page based)
+                    if end_page != 0:
+                        self.progress(page - start_page, end_page - start_page + 1)
+                    else:
+                        self.progress(0, 0) # Indeterminate
+
+                    # Construct URL
+                    if page == 1:
+                        category_url = f"{base_url}/category/{category}"
+                    else:
+                        category_url = f"{base_url}/category/{category}/page/{page}"
+                    
+                    self.log(f"กำลังโหลดหน้ารวมข่าว: {category_url}")
+
+                    try:
+                        resp = session.get(category_url, timeout=15)
+                        resp.raise_for_status()
+                    except Exception as e:
+                        self.log(f"[Error] ขัดข้องในการโหลดหน้า {page}: {e}")
+                        time.sleep(2)
+                        page += 1
+                        continue
+
+                    resp.encoding = "utf-8"
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    news_links = self.get_normal_news_links(soup)
+
+                    if not news_links:
+                        self.log(f"[Info] ไม่พบข่าวเพิ่มเติมที่หน้า {page}. จบการทำงาน.")
+                        break
+
+                    found_this_page = 0
+                    
+                    # Process each news link
+                    for idx, link in enumerate(news_links, start=1):
+                        if self.stop_event.is_set():
+                            break
+
+                        try:
+                            # 1. Extract Headline from listing
+                            headline_div = link.find("div", class_="w-full text-base font-semibold text-gray-700 hover:text-accentual-blue-main mb-2 line-clamp-3")
+                            if headline_div:
+                                headline = headline_div.get_text(strip=True)
+                            else:
+                                headline_tag = link.find("h3")
+                                headline = headline_tag.get_text(strip=True) if headline_tag else "No Headline"
+
+                            # 2. Extract URL
+                            news_url = link.get("href", "")
+                            if news_url.startswith("/"):
+                                news_url = base_url + news_url
+                            
+                            # Filter
+                            if f"/{category}/" not in news_url and not news_url.endswith(f"/{category}"):
+                                continue
+                            if news_url in seen_urls:
+                                continue
+                            
+                            seen_urls.add(news_url)
+
+                            # 3. Enter News Page
+                            try:
+                                news_resp = session.get(news_url, timeout=15)
+                                news_resp.raise_for_status()
+                            except Exception as e:
+                                self.log(f"  [Skip] โหลดเนื้อหาข่าวไม่ได้: {news_url} ({e})")
+                                continue
+
+                            news_resp.encoding = "utf-8"
+                            news_soup = BeautifulSoup(news_resp.text, "html.parser")
+
+                            # Title
+                            title_tag = news_soup.find("h1", class_="article-title")
+                            title = title_tag.get_text(strip=True) if title_tag else headline
+
+                            # Date
+                            date_tag = news_soup.find("p", class_="text-gray-400 text-subheadsm mb-4 md:mb-0")
+                            date = date_tag.get_text(strip=True) if date_tag else "-"
+
+                            # Content
+                            content_div = news_soup.find("div", class_="payload-richtext")
+                            content = ""
+                            if content_div:
+                                # Extract text with newlines for readability
+                                content_parts = []
+                                for tag in content_div.find_all(['p', 'li', 'blockquote', 'h2', 'h3']):
+                                    text = tag.get_text(strip=True)
+                                    if text:
+                                        content_parts.append(text)
+                                content = "\n\n".join(content_parts)
+                            
+                            # Add to list
+                            articles.append({
+                                "หัวข้อ": title,
+                                "เนื้อหา": content,
+                                "วันที่": date,
+                                "URL": news_url,
+                            })
+
+                            found_this_page += 1
+                            total_scraped += 1
+                            self.log(f"  + [{total_scraped}] {title[:40]}... | {date}")
+                            
+                            # Politeness delay
+                            time.sleep(0.5)
+
+                        except Exception as inner_e:
+                            self.log(f"  [Error] Parsing item {idx}: {inner_e}")
+
+                    self.log(f"[สรุป] หน้า {page}: ได้ข่าวใหม่ {found_this_page} ข่าว")
+                    
+                    if found_this_page == 0:
+                        self.log(f"[Info] ไม่พบข่าวใหม่ที่ตรงเงื่อนไขในหน้า {page}. อาจสิ้นสุดแล้ว")
+                        break
+
+                    page += 1
+
+            # Save to CSV
+            if articles:
+                df = pd.DataFrame(articles)
+                df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                msg = f"บันทึกไฟล์สำเร็จ: {csv_path}\nจำนวนข่าวทั้งหมด: {total_scraped}"
+                self.log(">>> " + msg.replace("\n", " "))
+                self.done(True, msg)
+            else:
+                msg = "ไม่พบข้อมูลข่าวเลย"
+                self.log(msg)
+                self.done(False, msg)
+
         except Exception as e:
-            log_func(f"[Error] โหลด {category_url} ผิดพลาด: {e}")
-            time.sleep(2)
-            page += 1
-            continue
+            self.log(f"[CRITICAL ERROR] {e}")
+            self.done(False, f"เกิดข้อผิดพลาดร้ายแรง: {e}")
 
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "html.parser")
-        news_links = get_normal_news_links(soup)
-        if not news_links:
-            log_func(f"[End] ไม่พบข่าวเพิ่มเติมที่หน้า {page}")
-            break
+# --- Presentation Layer: GUI ---
+class SpacebarGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry(App_SIZE)
+        # self.root.resizable(False, False) # Allow resizing slightly for better UX
 
-        found_this_page = 0
-        for idx, link in enumerate(news_links, start=1):
-            try:
-                headline_div = link.find("div", class_="w-full text-base font-semibold text-gray-700 hover:text-accentual-blue-main mb-2 line-clamp-3")
-                if headline_div:
-                    headline = headline_div.get_text(strip=True)
-                else:
-                    headline_tag = link.find("h3")
-                    headline = headline_tag.get_text(strip=True) if headline_tag else None
+        self.msg_queue = queue.Queue()
+        self.scraper_thread = None
+        self.scraper = None
 
-                news_url = link["href"]
-                if news_url.startswith("/"):
-                    news_url = base_url + news_url
+        self.setup_styles()
+        self.build_ui()
+        
+        # Start queue monitor
+        self.root.after(100, self.monitor_queue)
 
-                if f"/{category}/" not in news_url and not news_url.endswith(f"/{category}"):
-                    continue
-                if news_url in seen_urls:
-                    continue
-                seen_urls.add(news_url)
+    def setup_styles(self):
+        self.style = ttk.Style()
+        self.style.theme_use('clam') # Clean base theme
 
-                try:
-                    news_resp = requests.get(news_url, headers=headers, timeout=10)
-                    news_resp.raise_for_status()
-                except Exception as e:
-                    log_func(f"[Error] โหลดข่าว {news_url} ผิดพลาด: {e}")
-                    time.sleep(2)
-                    continue
+        # Define Colors
+        self.colors = {
+            'bg_light': '#F8F9FA', 'fg_light': '#212529',
+            'bg_dark': '#212529', 'fg_dark': '#F8F9FA',
+            'accent': '#0D6EFD', 'accent_hover': '#0B5ED7',
+            'card_light': '#FFFFFF', 'card_dark': '#2C3034',
+            'input_bg_light': '#FFFFFF', 'input_bg_dark': '#343A40'
+        }
+        
+        # Initial Light Mode
+        self.is_dark = False
+        self.apply_theme()
 
-                news_resp.encoding = "utf-8"
-                news_soup = BeautifulSoup(news_resp.text, "html.parser")
+    def apply_theme(self):
+        bg = self.colors['bg_dark'] if self.is_dark else self.colors['bg_light']
+        fg = self.colors['fg_dark'] if self.is_dark else self.colors['fg_light']
+        card_bg = self.colors['card_dark'] if self.is_dark else self.colors['card_light']
+        input_bg = self.colors['input_bg_dark'] if self.is_dark else self.colors['input_bg_light']
+        
+        self.root.configure(bg=bg)
+        
+        # Configure TTK Styles
+        self.style.configure("TFrame", background=bg)
+        self.style.configure("Card.TFrame", background=card_bg, relief="flat", borderwidth=0)
+        
+        self.style.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
+        self.style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), background=bg, foreground=self.colors['accent'])
+        self.style.configure("SubLabel.TLabel", font=("Segoe UI", 8), background=card_bg, foreground="gray")
+        self.style.configure("Card.TLabel", background=card_bg, foreground=fg, font=("Segoe UI", 10))
+        
+        self.style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6, background=self.colors['accent'], foreground="white", borderwidth=0)
+        self.style.map("TButton", background=[('active', self.colors['accent_hover'])])
+        self.style.configure("Stop.TButton", background="#DC3545")
+        self.style.map("Stop.TButton", background=[('active', '#BB2D3B')])
 
-                title_tag = news_soup.find("h1", class_="article-title")
-                title = title_tag.get_text(strip=True) if title_tag else headline
+        self.style.configure("TEntry", fieldbackground=input_bg, foreground=fg, padding=5)
+        self.style.configure("TCombobox", fieldbackground=input_bg, background=input_bg, foreground=fg, padding=5)
+        
+        # Checkbutton
+        self.style.configure("TCheckbutton", background=bg, foreground=fg, font=("Segoe UI", 9))
 
-                date_tag = news_soup.find("p", class_="text-gray-400 text-subheadsm mb-4 md:mb-0")
-                date = date_tag.get_text(strip=True) if date_tag else None
+        # Helper for Log widget
+        if hasattr(self, 'log_text'):
+            self.log_text.config(bg=card_bg, fg=fg, insertbackground=fg)
 
-                content_div = news_soup.find("div", class_="payload-richtext")
-                content = ""
-                if content_div:
-                    for tag in content_div.find_all(['p', 'li', 'blockquote']):
-                        content += tag.get_text(separator=" ", strip=True) + "\n"
-                content = content.strip()
+    def build_ui(self):
+        # Main Container with Padding
+        main_frame = ttk.Frame(self.root, padding=20)
+        main_frame.pack(fill="both", expand=True)
 
-                articles.append({
-                    "หัวข้อ": title,
-                    "เนื้อหา": content,
-                    "วันที่": date,
-                    "URL": news_url,
-                })
+        # Header
+        header_lbl = ttk.Label(main_frame, text="Spacebar News Extractor", style="Header.TLabel")
+        header_lbl.pack(anchor="w", pady=(0, 15))
 
-                found_this_page += 1
-                total_scraped += 1
+        # --- Settings Card ---
+        settings_frame = ttk.Frame(main_frame, style="Card.TFrame", padding=15)
+        settings_frame.pack(fill="x", pady=(0, 10))
 
-                log_func(f"[{total_scraped}] {title[:45]} | Date: {date}")
-                time.sleep(0.7)
-            except Exception as e:
-                log_func(f"[Error] ใน page {page}, idx {idx}: {e}")
-                continue
+        # Category
+        ttk.Label(settings_frame, text="หมวดหมู่ข่าว (Category)", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=5)
+        self.category_var = tk.StringVar(value=list(CATEGORIES.keys())[0])
+        self.cb_category = ttk.Combobox(settings_frame, textvariable=self.category_var, values=list(CATEGORIES.keys()), state="readonly")
+        self.cb_category.grid(row=0, column=1, sticky="ew", padx=(10, 0))
 
-        log_func(f"[สรุป] หน้า {page}: ได้ข่าวใหม่ {found_this_page} ข่าว (รวมทั้งหมด {total_scraped})")
-        if found_this_page == 0:
-            log_func(f"[End] ไม่มีข่าวใหม่ที่หน้า {page}")
-            break
-        page += 1
+        # Pages
+        page_frame = ttk.Frame(settings_frame, style="Card.TFrame")
+        page_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
+        
+        ttk.Label(page_frame, text="เริ่มหน้า:", style="Card.TLabel").pack(side="left")
+        self.entry_start = ttk.Entry(page_frame, width=5, justify="center")
+        self.entry_start.insert(0, "1")
+        self.entry_start.pack(side="left", padx=5)
 
-    df = pd.DataFrame(articles)
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    log_func(f"[Done] บันทึก {total_scraped} ข่าวเป็น {csv_path}")
-    messagebox.showinfo("เสร็จสิ้น", f"บันทึก {total_scraped} ข่าวเป็น\n{csv_path}")
+        ttk.Label(page_frame, text="ถึงหน้า:", style="Card.TLabel").pack(side="left", padx=(15, 0))
+        self.entry_end = ttk.Entry(page_frame, width=5, justify="center")
+        self.entry_end.insert(0, "1")
+        self.entry_end.pack(side="left", padx=5)
+        
+        ttk.Label(page_frame, text="(ใส่ 0 หากต้องการดึงจนจบ)", style="SubLabel.TLabel").pack(side="left", padx=5)
 
-def choose_csv_path():
-    filename = filedialog.asksaveasfilename(
-        defaultextension=".csv",
-        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        initialfile="spacebar_news.csv"
-    )
-    if filename:
-        csv_path_var.set(filename)
+        # File Path
+        ttk.Label(settings_frame, text="บันทึกไฟล์ (Save as)", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=5)
+        file_frame = ttk.Frame(settings_frame, style="Card.TFrame")
+        file_frame.grid(row=2, column=1, sticky="ew", padx=(10, 0))
+        
+        self.path_var = tk.StringVar(value="spacebar_news.csv")
+        self.entry_path = ttk.Entry(file_frame, textvariable=self.path_var)
+        self.entry_path.pack(side="left", fill="x", expand=True)
+        ttk.Button(file_frame, text="Browse", width=6, command=self.browse_file).pack(side="left", padx=(5, 0))
 
-def run_scraper():
-    try:
-        start = int(entry_start.get()) if entry_start.get().strip() else 1
-        end = int(entry_end.get()) if entry_end.get().strip() else 1
-        if start < 1: start = 1
-    except Exception:
-        start, end = 1, 1
+        settings_frame.columnconfigure(1, weight=1)
 
-    csv_path = csv_path_var.get().strip()
-    if not csv_path:
-        messagebox.showerror("Error", "กรุณากำหนดชื่อไฟล์หรือ path สำหรับ CSV ก่อน")
-        return
+        # --- Action Area ---
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill="x", pady=10)
 
-    category_label = dropdown_category.get()
-    category = CATEGORIES[category_label]
+        self.btn_start = ttk.Button(action_frame, text="Start Scraping", command=self.start_task)
+        self.btn_start.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
-    entry_start.config(state="disabled")
-    entry_end.config(state="disabled")
-    dropdown_category.config(state="disabled")
-    btn_choose_path.config(state="disabled")
-    btn_start.config(state="disabled")
+        self.btn_stop = ttk.Button(action_frame, text="Stop", command=self.stop_task, style="Stop.TButton", state="disabled")
+        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-    if end == 0:
-        progress_bar["mode"] = "indeterminate"
-        progress_bar.start()
-    else:
-        progress_bar["mode"] = "determinate"
-        progress_bar["maximum"] = (end - start + 1)
-        progress_bar["value"] = 0
+        # Dark Mode Toggle
+        self.dark_var = tk.BooleanVar(value=False)
+        self.chk_dark = ttk.Checkbutton(main_frame, text="Dark Mode / โหมดมืด", variable=self.dark_var, command=self.toggle_dark_mode, style="TCheckbutton")
+        self.chk_dark.pack(anchor="e", pady=(0, 10))
 
-    log_text.config(state="normal")
-    log_text.delete(1.0, tk.END)
-    log_text.config(state="disabled")
+        # --- Status & Log ---
+        self.lbl_status = ttk.Label(main_frame, text="Ready", font=("Segoe UI", 9))
+        self.lbl_status.pack(anchor="w")
 
-    def log_func(msg):
-        log_text.config(state="normal")
-        log_text.insert(tk.END, msg + "\n")
-        log_text.see(tk.END)
-        log_text.config(state="disabled")
-        log_text.update_idletasks()
+        self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
+        self.progress.pack(fill="x", pady=(5, 10))
 
-    def progress_func(val, maxval):
-        if end == 0:
+        ttk.Label(main_frame, text="System Log:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        
+        # Log Text with Scrollbar
+        log_frame = ttk.Frame(main_frame)
+        log_frame.pack(fill="both", expand=True)
+        
+        self.log_text = tk.Text(log_frame, height=10, state="disabled", font=("Consolas", 9), relief="flat", padx=10, pady=10)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        
+        scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scroll.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=scroll.set)
+
+    def browse_file(self):
+        filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="spacebar_news.csv")
+        if filename:
+            self.path_var.set(filename)
+
+    def toggle_dark_mode(self):
+        self.is_dark = self.dark_var.get()
+        self.apply_theme()
+
+    def append_log(self, text):
+        self.log_text.config(state="normal")
+        self.log_text.insert(tk.END, f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {text}\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state="disabled")
+
+    def lock_ui(self, locked):
+        state = "disabled" if locked else "normal"
+        readonly = "disabled" if locked else "readonly"
+        
+        self.entry_start.config(state=state)
+        self.entry_end.config(state=state)
+        self.entry_path.config(state=state)
+        self.cb_category.config(state=readonly)
+        self.btn_start.config(state=state)
+        self.btn_stop.config(state="normal" if locked else "disabled")
+
+    def start_task(self):
+        # Validation
+        try:
+            start = int(self.entry_start.get())
+            end = int(self.entry_end.get())
+            if start < 1: raise ValueError("Start Page must be >= 1")
+            if end != 0 and end < start: raise ValueError("End Page must be >= Start Page (or 0)")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
             return
-        progress_bar["maximum"] = maxval
-        progress_bar["value"] = val
-        progress_bar.update_idletasks()
 
-    def page_progress_func(current, end_val):
-        lbl_page_progress.config(text=f"กำลังดึงหน้าที่: {current} / {end_val}")
-        lbl_page_progress.update_idletasks()
+        csv_path = self.path_var.get()
+        if not csv_path:
+            messagebox.showerror("Error", "Please specify a CSV file path.")
+            return
 
-    def enable_all():
-        entry_start.config(state="normal")
-        entry_end.config(state="normal")
-        dropdown_category.config(state="readonly")
-        btn_choose_path.config(state="normal")
-        btn_start.config(state="normal")
-        progress_bar.stop()
-        progress_bar["mode"] = "determinate"
-        progress_bar.update_idletasks()
-        lbl_page_progress.config(text="")
+        cat_name = self.category_var.get()
+        cat_slug = CATEGORIES.get(cat_name, "politics")
 
-    def wrapper():
-        scrape_news(category, start, end, csv_path, log_func, progress_func, page_progress_func)
-        enable_all()
+        # Prepare UI
+        self.lock_ui(True)
+        self.progress['value'] = 0
+        self.log_text.config(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state="disabled")
+        
+        # Init Scraper
+        self.scraper = SpacebarScraper(self.msg_queue)
+        self.scraper_thread = threading.Thread(target=self.scraper.run, args=(cat_slug, start, end, csv_path), daemon=True)
+        self.scraper_thread.start()
 
-    threading.Thread(target=wrapper).start()
+    def stop_task(self):
+        if self.scraper:
+            self.scraper.stop_event.set()
+            self.append_log(">>> กำลังหยุดการทำงาน... กรุณารอสักครู่")
+            self.btn_stop.config(state="disabled")
 
-def toggle_dark_mode():
-    mode = darkmode_var.get()
-    style = ttk.Style()
-    if mode:
-        root.configure(bg="#23272f")
-        frm.configure(style="Dark.TFrame")
-        style.configure("Dark.TFrame", background="#23272f")
-        style.configure("Dark.TLabel", background="#23272f", foreground="#e3eaf7")
-        style.configure("Dark.TButton", background="#394150", foreground="#c9d1e9")
-        style.configure("Dark.TCombobox", fieldbackground="#394150", background="#394150", foreground="#e3eaf7")
-        style.configure("Dark.TEntry", fieldbackground="#394150", background="#394150", foreground="#e3eaf7")
-        for widget in frm.winfo_children():
-            if isinstance(widget, ttk.Entry) or isinstance(widget, ttk.Combobox):
-                widget.configure(style="Dark.TEntry" if isinstance(widget, ttk.Entry) else "Dark.TCombobox")
-            elif isinstance(widget, ttk.Label):
-                widget.configure(style="Dark.TLabel")
-            elif isinstance(widget, ttk.Button):
-                widget.configure(style="Dark.TButton")
-        log_text.config(bg="#242933", fg="#e3eaf7")
-    else:
-        root.configure(bg="#f6f7fb")
-        frm.configure(style="TFrame")
-        for widget in frm.winfo_children():
-            if isinstance(widget, ttk.Entry) or isinstance(widget, ttk.Combobox):
-                widget.configure(style="TEntry" if isinstance(widget, ttk.Entry) else "TCombobox")
-            elif isinstance(widget, ttk.Label):
-                widget.configure(style="TLabel")
-            elif isinstance(widget, ttk.Button):
-                widget.configure(style="TButton")
-        log_text.config(bg="#f8fafb", fg="#333")
+    def monitor_queue(self):
+        try:
+            while True:
+                msg_type, data = self.msg_queue.get_nowait()
+                
+                if msg_type == "LOG":
+                    self.append_log(data)
+                elif msg_type == "STATUS":
+                    self.lbl_status.config(text=data)
+                elif msg_type == "PROGRESS":
+                    val, maximum = data
+                    if maximum:
+                        self.progress.config(mode="determinate", maximum=maximum, value=val)
+                    else:
+                        self.progress.config(mode="indeterminate")
+                        self.progress.start(10)
+                elif msg_type == "DONE":
+                    success, summary = data
+                    self.lock_ui(False)
+                    self.progress.stop()
+                    self.progress['value'] = 100
+                    self.lbl_status.config(text="เสร็จสิ้น" if success else "หยุด/เกิดข้อผิดพลาด")
+                    messagebox.showinfo("Result", summary)
+                    
+                self.msg_queue.task_done()
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(100, self.monitor_queue)
 
-root = tk.Tk()
-root.title("Spacebar News Scraper")
-root.geometry("440x520")
-root.resizable(False, False)
-root.configure(bg="#f6f7fb")
-
-frm = ttk.Frame(root, padding=22)
-frm.pack(fill="both", expand=True)
-
-# ----- หมวดข่าว -----
-ttk.Label(frm, text="เลือกหมวดข่าว:").grid(row=0, column=0, sticky="e", pady=4)
-dropdown_category = ttk.Combobox(frm, values=list(CATEGORIES.keys()), state="readonly", width=23)
-dropdown_category.set("การเมือง (Politics)")
-dropdown_category.grid(row=0, column=1, pady=4, sticky="w")
-
-# ----- หน้าเริ่มต้น/สิ้นสุด -----
-ttk.Label(frm, text="หน้าเริ่มต้น:").grid(row=1, column=0, sticky="e", pady=4)
-entry_start = ttk.Entry(frm, width=8)
-entry_start.grid(row=1, column=1, sticky="w", pady=4)
-entry_start.insert(0, "1")
-ttk.Label(frm, text="(ค่าเริ่มต้น = 1)").grid(row=1, column=2, sticky="w", padx=2)
-
-ttk.Label(frm, text="หน้าสิ้นสุด:").grid(row=2, column=0, sticky="e", pady=4)
-entry_end = ttk.Entry(frm, width=8)
-entry_end.grid(row=2, column=1, sticky="w", pady=4)
-entry_end.insert(0, "1")
-ttk.Label(frm, text="(0 = ดึงจนจบ)").grid(row=2, column=2, sticky="w", padx=2)
-
-# ----- เลือกไฟล์ CSV -----
-ttk.Label(frm, text="CSV ไฟล์ปลายทาง:").grid(row=3, column=0, sticky="e", pady=4)
-csv_path_var = tk.StringVar()
-entry_csv = ttk.Entry(frm, textvariable=csv_path_var, width=28)
-entry_csv.grid(row=3, column=1, pady=4, sticky="w")
-entry_csv.insert(0, "spacebar_news.csv")
-btn_choose_path = ttk.Button(frm, text="เลือก...", command=choose_csv_path)
-btn_choose_path.grid(row=3, column=2, padx=2)
-
-# ----- ปุ่มเริ่ม -----
-btn_start = ttk.Button(frm, text="เริ่มดึงข่าว", command=run_scraper)
-btn_start.grid(row=4, column=0, columnspan=3, pady=14, ipadx=12)
-
-# ----- Label แสดงหน้าปัจจุบัน -----
-lbl_page_progress = ttk.Label(frm, text="", font=("Tahoma", 11))
-lbl_page_progress.grid(row=5, column=0, columnspan=3, sticky="w")
-
-# ----- Progress & Log -----
-progress_bar = ttk.Progressbar(frm, length=350, mode="determinate")
-progress_bar.grid(row=6, column=0, columnspan=3, pady=3)
-
-ttk.Label(frm, text="Log:").grid(row=7, column=0, columnspan=3, sticky="w")
-log_text = tk.Text(frm, height=12, width=52, state="disabled", bg="#f8fafb", fg="#333", wrap="word", font=("Consolas", 10))
-log_text.grid(row=8, column=0, columnspan=3, pady=4)
-
-# ----- Dark Mode -----
-darkmode_var = tk.IntVar()
-cb_dark = tk.Checkbutton(frm, text="Dark mode", variable=darkmode_var, command=toggle_dark_mode)
-cb_dark.grid(row=9, column=0, sticky="w", pady=8, columnspan=3)
-
-root.mainloop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SpacebarGUI(root)
+    root.mainloop()
