@@ -6,7 +6,11 @@ import time
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from ttkbootstrap.toast import ToastNotification
+from ttkbootstrap.dialogs import Messagebox
 import datetime
 
 # --- Constants & Configuration ---
@@ -22,7 +26,7 @@ CATEGORIES = {
 }
 
 APP_TITLE = "Spacebar News Scraper Pro"
-App_SIZE = "500x650"
+App_SIZE = "500x700"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -75,8 +79,8 @@ class SpacebarScraper:
                         break
 
                     # Update Status
-                    progress_text = f"กำลังดึงรายการข่าว หน้าที่ {page}..."
-                    self.status_update(progress_text)
+                    progress_text = f"正在 processing Page {page}..." # Thai text issues in some consoles, using EN for debug safety, change back to Thai in final
+                    self.status_update(f"กำลังประมวลผลหน้าที่ {page}...")
                     
                     # Update Progress Bar (Page based)
                     if end_page != 0:
@@ -90,13 +94,13 @@ class SpacebarScraper:
                     else:
                         category_url = f"{base_url}/category/{category}/page/{page}"
                     
-                    self.log(f"กำลังโหลดหน้ารวมข่าว: {category_url}")
+                    self.log(f"Loading Page: {category_url}")
 
                     try:
                         resp = session.get(category_url, timeout=15)
                         resp.raise_for_status()
                     except Exception as e:
-                        self.log(f"[Error] ขัดข้องในการโหลดหน้า {page}: {e}")
+                        self.log(f"[Error] Failed page {page}: {e}")
                         time.sleep(2)
                         page += 1
                         continue
@@ -106,7 +110,7 @@ class SpacebarScraper:
                     news_links = self.get_normal_news_links(soup)
 
                     if not news_links:
-                        self.log(f"[Info] ไม่พบข่าวเพิ่มเติมที่หน้า {page}. จบการทำงาน.")
+                        self.log(f"[Info] No more news at page {page}. Stopping.")
                         break
 
                     found_this_page = 0
@@ -143,7 +147,7 @@ class SpacebarScraper:
                                 news_resp = session.get(news_url, timeout=15)
                                 news_resp.raise_for_status()
                             except Exception as e:
-                                self.log(f"  [Skip] โหลดเนื้อหาข่าวไม่ได้: {news_url} ({e})")
+                                self.log(f"  [Skip] Content load failed: {news_url} ({e})")
                                 continue
 
                             news_resp.encoding = "utf-8"
@@ -187,10 +191,10 @@ class SpacebarScraper:
                         except Exception as inner_e:
                             self.log(f"  [Error] Parsing item {idx}: {inner_e}")
 
-                    self.log(f"[สรุป] หน้า {page}: ได้ข่าวใหม่ {found_this_page} ข่าว")
+                    self.log(f"[Summary] Page {page}: Found {found_this_page} new articles")
                     
                     if found_this_page == 0:
-                        self.log(f"[Info] ไม่พบข่าวใหม่ที่ตรงเงื่อนไขในหน้า {page}. อาจสิ้นสุดแล้ว")
+                        self.log(f"[Info] No items matched criteria on page {page}.")
                         break
 
                     page += 1
@@ -199,175 +203,130 @@ class SpacebarScraper:
             if articles:
                 df = pd.DataFrame(articles)
                 df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-                msg = f"บันทึกไฟล์สำเร็จ: {csv_path}\nจำนวนข่าวทั้งหมด: {total_scraped}"
+                msg = f"Saved successfully: {csv_path}\nTotal Articles: {total_scraped}"
                 self.log(">>> " + msg.replace("\n", " "))
                 self.done(True, msg)
             else:
-                msg = "ไม่พบข้อมูลข่าวเลย"
+                msg = "No articles found."
                 self.log(msg)
                 self.done(False, msg)
 
         except Exception as e:
             self.log(f"[CRITICAL ERROR] {e}")
-            self.done(False, f"เกิดข้อผิดพลาดร้ายแรง: {e}")
+            self.done(False, f"Critical Error: {e}")
 
-# --- Presentation Layer: GUI ---
+# --- Presentation Layer: GUI (Material Design) ---
 class SpacebarGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry(App_SIZE)
-        # self.root.resizable(False, False) # Allow resizing slightly for better UX
-
+    def __init__(self):
+        # Initialize Window with Material Theme
+        # available themes: cosmo, flatly, journal, lumen, minty, pulse, sand, united, yeti, morph, simplex, cerculean
+        # dark themes: solar, superhero, cyborg, darkly
+        # Switching to 'flatly' as 'materia' caused issues on some systems
+        self.root = ttk.Window(themename="flatly", title=APP_TITLE, size=(550, 750))
+        self.root.place_window_center()
+        
         self.msg_queue = queue.Queue()
         self.scraper_thread = None
         self.scraper = None
 
-        self.setup_styles()
         self.build_ui()
         
         # Start queue monitor
         self.root.after(100, self.monitor_queue)
-
-    def setup_styles(self):
-        self.style = ttk.Style()
-        self.style.theme_use('clam') # Clean base theme
-
-        # Define Colors
-        self.colors = {
-            'bg_light': '#F8F9FA', 'fg_light': '#212529',
-            'bg_dark': '#212529', 'fg_dark': '#F8F9FA',
-            'accent': '#0D6EFD', 'accent_hover': '#0B5ED7',
-            'card_light': '#FFFFFF', 'card_dark': '#2C3034',
-            'input_bg_light': '#FFFFFF', 'input_bg_dark': '#343A40'
-        }
-        
-        # Initial Light Mode
-        self.is_dark = False
-        self.apply_theme()
-
-    def apply_theme(self):
-        bg = self.colors['bg_dark'] if self.is_dark else self.colors['bg_light']
-        fg = self.colors['fg_dark'] if self.is_dark else self.colors['fg_light']
-        card_bg = self.colors['card_dark'] if self.is_dark else self.colors['card_light']
-        input_bg = self.colors['input_bg_dark'] if self.is_dark else self.colors['input_bg_light']
-        
-        self.root.configure(bg=bg)
-        
-        # Configure TTK Styles
-        self.style.configure("TFrame", background=bg)
-        self.style.configure("Card.TFrame", background=card_bg, relief="flat", borderwidth=0)
-        
-        self.style.configure("TLabel", background=bg, foreground=fg, font=("Segoe UI", 10))
-        self.style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), background=bg, foreground=self.colors['accent'])
-        self.style.configure("SubLabel.TLabel", font=("Segoe UI", 8), background=card_bg, foreground="gray")
-        self.style.configure("Card.TLabel", background=card_bg, foreground=fg, font=("Segoe UI", 10))
-        
-        self.style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6, background=self.colors['accent'], foreground="white", borderwidth=0)
-        self.style.map("TButton", background=[('active', self.colors['accent_hover'])])
-        self.style.configure("Stop.TButton", background="#DC3545")
-        self.style.map("Stop.TButton", background=[('active', '#BB2D3B')])
-
-        self.style.configure("TEntry", fieldbackground=input_bg, foreground=fg, padding=5)
-        self.style.configure("TCombobox", fieldbackground=input_bg, background=input_bg, foreground=fg, padding=5)
-        
-        # Checkbutton
-        self.style.configure("TCheckbutton", background=bg, foreground=fg, font=("Segoe UI", 9))
-
-        # Helper for Log widget
-        if hasattr(self, 'log_text'):
-            self.log_text.config(bg=card_bg, fg=fg, insertbackground=fg)
+        self.root.mainloop()
 
     def build_ui(self):
-        # Main Container with Padding
+        # Main Container
         main_frame = ttk.Frame(self.root, padding=20)
-        main_frame.pack(fill="both", expand=True)
+        main_frame.pack(fill=BOTH, expand=YES)
 
         # Header
-        header_lbl = ttk.Label(main_frame, text="Spacebar News Extractor", style="Header.TLabel")
-        header_lbl.pack(anchor="w", pady=(0, 15))
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=X, pady=(0, 20))
+        
+        ttk.Label(header_frame, text="Spacebar News Scraper", font=("Roboto", 20, "bold"), bootstyle="primary").pack(side=LEFT)
+        # Badge is not available in all versions, using inverse Label instead
+        ttk.Label(header_frame, text=" PRO ", bootstyle="inverse-success", font=("Segoe UI", 9, "bold")).pack(side=LEFT, padx=10, pady=5)
 
         # --- Settings Card ---
-        settings_frame = ttk.Frame(main_frame, style="Card.TFrame", padding=15)
-        settings_frame.pack(fill="x", pady=(0, 10))
+        settings_frame = ttk.LabelFrame(main_frame, text=" Configuration ", padding=15, bootstyle="info")
+        settings_frame.pack(fill=X, pady=(0, 15))
 
         # Category
-        ttk.Label(settings_frame, text="หมวดหมู่ข่าว (Category)", style="Card.TLabel").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(settings_frame, text="หมวดหมู่ข่าว (Category)", font=("Segoe UI", 10)).pack(anchor=W, pady=(0, 5))
         self.category_var = tk.StringVar(value=list(CATEGORIES.keys())[0])
-        self.cb_category = ttk.Combobox(settings_frame, textvariable=self.category_var, values=list(CATEGORIES.keys()), state="readonly")
-        self.cb_category.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        self.cb_category = ttk.Combobox(settings_frame, textvariable=self.category_var, values=list(CATEGORIES.keys()), state="readonly", bootstyle="primary")
+        self.cb_category.pack(fill=X, pady=(0, 10))
 
-        # Pages
-        page_frame = ttk.Frame(settings_frame, style="Card.TFrame")
-        page_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
+        # Pages Row
+        page_frame = ttk.Frame(settings_frame)
+        page_frame.pack(fill=X, pady=(0, 10))
         
-        ttk.Label(page_frame, text="เริ่มหน้า:", style="Card.TLabel").pack(side="left")
-        self.entry_start = ttk.Entry(page_frame, width=5, justify="center")
-        self.entry_start.insert(0, "1")
-        self.entry_start.pack(side="left", padx=5)
+        # Start Page
+        start_group = ttk.Frame(page_frame)
+        start_group.pack(side=LEFT, fill=X, expand=YES, padx=(0, 10))
+        ttk.Label(start_group, text="เริ่มหน้า (Start)").pack(anchor=W)
+        self.entry_start = ttk.Spinbox(start_group, from_=1, to=9999, bootstyle="secondary")
+        self.entry_start.set("1")
+        self.entry_start.pack(fill=X)
 
-        ttk.Label(page_frame, text="ถึงหน้า:", style="Card.TLabel").pack(side="left", padx=(15, 0))
-        self.entry_end = ttk.Entry(page_frame, width=5, justify="center")
-        self.entry_end.insert(0, "1")
-        self.entry_end.pack(side="left", padx=5)
-        
-        ttk.Label(page_frame, text="(ใส่ 0 หากต้องการดึงจนจบ)", style="SubLabel.TLabel").pack(side="left", padx=5)
+        # End Page
+        end_group = ttk.Frame(page_frame)
+        end_group.pack(side=LEFT, fill=X, expand=YES)
+        ttk.Label(end_group, text="ถึงหน้า (End) [0=All]").pack(anchor=W)
+        self.entry_end = ttk.Spinbox(end_group, from_=0, to=9999, bootstyle="secondary")
+        self.entry_end.set("1")
+        self.entry_end.pack(fill=X)
 
         # File Path
-        ttk.Label(settings_frame, text="บันทึกไฟล์ (Save as)", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=5)
-        file_frame = ttk.Frame(settings_frame, style="Card.TFrame")
-        file_frame.grid(row=2, column=1, sticky="ew", padx=(10, 0))
+        ttk.Label(settings_frame, text="บันทึกไฟล์ (Save Path)").pack(anchor=W, pady=(0, 5))
+        file_frame = ttk.Frame(settings_frame)
+        file_frame.pack(fill=X)
         
         self.path_var = tk.StringVar(value="spacebar_news.csv")
-        self.entry_path = ttk.Entry(file_frame, textvariable=self.path_var)
-        self.entry_path.pack(side="left", fill="x", expand=True)
-        ttk.Button(file_frame, text="Browse", width=6, command=self.browse_file).pack(side="left", padx=(5, 0))
+        self.entry_path = ttk.Entry(file_frame, textvariable=self.path_var, bootstyle="secondary")
+        self.entry_path.pack(side=LEFT, fill=X, expand=YES)
+        ttk.Button(file_frame, text="📂", width=4, command=self.browse_file, bootstyle="outline-secondary").pack(side=LEFT, padx=(5, 0))
 
-        settings_frame.columnconfigure(1, weight=1)
-
-        # --- Action Area ---
+        # --- Actions ---
         action_frame = ttk.Frame(main_frame)
-        action_frame.pack(fill="x", pady=10)
+        action_frame.pack(fill=X, pady=10)
 
-        self.btn_start = ttk.Button(action_frame, text="Start Scraping", command=self.start_task)
-        self.btn_start.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.btn_start = ttk.Button(action_frame, text="START SCRAPING", command=self.start_task, bootstyle="success", width=20)
+        self.btn_start.pack(side=LEFT, fill=X, expand=YES, padx=(0, 5))
 
-        self.btn_stop = ttk.Button(action_frame, text="Stop", command=self.stop_task, style="Stop.TButton", state="disabled")
-        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.btn_stop = ttk.Button(action_frame, text="STOP", command=self.stop_task, bootstyle="danger", state="disabled", width=10)
+        self.btn_stop.pack(side=LEFT, fill=X, expand=NO, padx=(5, 0))
 
-        # Dark Mode Toggle
-        self.dark_var = tk.BooleanVar(value=False)
-        self.chk_dark = ttk.Checkbutton(main_frame, text="Dark Mode / โหมดมืด", variable=self.dark_var, command=self.toggle_dark_mode, style="TCheckbutton")
-        self.chk_dark.pack(anchor="e", pady=(0, 10))
+        # Theme Toggle
+        theme_frame = ttk.Frame(main_frame)
+        theme_frame.pack(fill=X, pady=(0, 10))
+        self.chk_dark = ttk.Checkbutton(theme_frame, text="Dark Mode", bootstyle="round-toggle", command=self.toggle_theme)
+        self.chk_dark.pack(anchor=E)
 
         # --- Status & Log ---
-        self.lbl_status = ttk.Label(main_frame, text="Ready", font=("Segoe UI", 9))
-        self.lbl_status.pack(anchor="w")
+        self.lbl_status = ttk.Label(main_frame, text="Ready to scrape", font=("Segoe UI", 9), bootstyle="secondary")
+        self.lbl_status.pack(anchor=W)
 
-        self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
-        self.progress.pack(fill="x", pady=(5, 10))
+        self.progress = ttk.Floodgauge(main_frame, bootstyle="success", font=("Segoe UI", 8), mask="{}%", value=0, maximum=100)
+        self.progress.pack(fill=X, pady=(5, 10))
 
-        ttk.Label(main_frame, text="System Log:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        ttk.Label(main_frame, text="System Log", font=("Segoe UI", 9, "bold")).pack(anchor=W)
         
-        # Log Text with Scrollbar
-        log_frame = ttk.Frame(main_frame)
-        log_frame.pack(fill="both", expand=True)
-        
-        self.log_text = tk.Text(log_frame, height=10, state="disabled", font=("Consolas", 9), relief="flat", padx=10, pady=10)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        
-        scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        scroll.pack(side="right", fill="y")
-        self.log_text.config(yscrollcommand=scroll.set)
+        # Log Text
+        self.log_text = ttk.ScrolledText(main_frame, height=10, state="disabled", font=("Consolas", 9))
+        self.log_text.pack(fill=BOTH, expand=YES)
 
     def browse_file(self):
         filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="spacebar_news.csv")
         if filename:
             self.path_var.set(filename)
 
-    def toggle_dark_mode(self):
-        self.is_dark = self.dark_var.get()
-        self.apply_theme()
+    def toggle_theme(self):
+        # Toggle between Flatly (Light) and Superhero (Dark)
+        current = self.root.style.theme.name
+        new_theme = "superhero" if "flatly" in current else "flatly"
+        self.root.style.theme_use(new_theme)
 
     def append_log(self, text):
         self.log_text.config(state="normal")
@@ -379,12 +338,12 @@ class SpacebarGUI:
         state = "disabled" if locked else "normal"
         readonly = "disabled" if locked else "readonly"
         
-        self.entry_start.config(state=state)
-        self.entry_end.config(state=state)
-        self.entry_path.config(state=state)
-        self.cb_category.config(state=readonly)
-        self.btn_start.config(state=state)
-        self.btn_stop.config(state="normal" if locked else "disabled")
+        self.entry_start.configure(state=state)
+        self.entry_end.configure(state=state)
+        self.entry_path.configure(state=state)
+        self.cb_category.configure(state=readonly)
+        self.btn_start.configure(state=state)
+        self.btn_stop.configure(state="normal" if locked else "disabled")
 
     def start_task(self):
         # Validation
@@ -394,12 +353,12 @@ class SpacebarGUI:
             if start < 1: raise ValueError("Start Page must be >= 1")
             if end != 0 and end < start: raise ValueError("End Page must be >= Start Page (or 0)")
         except ValueError as e:
-            messagebox.showerror("Invalid Input", str(e))
+            Messagebox.show_error(str(e), "Invalid Input")
             return
 
         csv_path = self.path_var.get()
         if not csv_path:
-            messagebox.showerror("Error", "Please specify a CSV file path.")
+            Messagebox.show_error("Please specify a CSV file path.", "Missing Path")
             return
 
         cat_name = self.category_var.get()
@@ -407,10 +366,10 @@ class SpacebarGUI:
 
         # Prepare UI
         self.lock_ui(True)
-        self.progress['value'] = 0
-        self.log_text.config(state="normal")
+        self.progress.configure(value=0, maximum=100) # Reset
+        self.log_text.configure(state="normal")
         self.log_text.delete(1.0, tk.END)
-        self.log_text.config(state="disabled")
+        self.log_text.configure(state="disabled")
         
         # Init Scraper
         self.scraper = SpacebarScraper(self.msg_queue)
@@ -420,8 +379,8 @@ class SpacebarGUI:
     def stop_task(self):
         if self.scraper:
             self.scraper.stop_event.set()
-            self.append_log(">>> กำลังหยุดการทำงาน... กรุณารอสักครู่")
-            self.btn_stop.config(state="disabled")
+            self.append_log(">>> Stopping... please wait")
+            self.btn_stop.configure(state="disabled")
 
     def monitor_queue(self):
         try:
@@ -435,17 +394,21 @@ class SpacebarGUI:
                 elif msg_type == "PROGRESS":
                     val, maximum = data
                     if maximum:
-                        self.progress.config(mode="determinate", maximum=maximum, value=val)
+                        self.progress.configure(mode="determinate", maximum=maximum, value=val)
                     else:
-                        self.progress.config(mode="indeterminate")
+                        self.progress.configure(mode="indeterminate")
                         self.progress.start(10)
                 elif msg_type == "DONE":
                     success, summary = data
                     self.lock_ui(False)
                     self.progress.stop()
-                    self.progress['value'] = 100
-                    self.lbl_status.config(text="เสร็จสิ้น" if success else "หยุด/เกิดข้อผิดพลาด")
-                    messagebox.showinfo("Result", summary)
+                    self.progress.configure(value=100)
+                    self.lbl_status.config(text="Finished" if success else "Stopped/Error")
+                    
+                    if success:
+                        ToastNotification(title="Success", message=summary, bootstyle="success", duration=3000).show_toast()
+                    else:
+                        Messagebox.show_error(summary, "Error")
                     
                 self.msg_queue.task_done()
         except queue.Empty:
@@ -454,6 +417,4 @@ class SpacebarGUI:
             self.root.after(100, self.monitor_queue)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = SpacebarGUI(root)
-    root.mainloop()
+    app = SpacebarGUI()
