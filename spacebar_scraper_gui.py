@@ -2,16 +2,23 @@
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import time
+import os
 import threading
 import queue
+import time
+import datetime
+from urllib.parse import urljoin
+from typing import List, Dict, Set, Optional, Tuple, Any
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 import tkinter as tk
 from tkinter import filedialog
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.toast import ToastNotification
 from ttkbootstrap.dialogs import Messagebox
-import datetime
 
 # --- Constants & Configuration ---
 CATEGORIES = {
@@ -26,30 +33,38 @@ CATEGORIES = {
 }
 
 APP_TITLE = "Spacebar News Scraper Pro"
-App_SIZE = "500x700"
+APP_SIZE = (580, 780)  # Slightly larger for better spacing
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 # --- Logic Layer: Scraper ---
 class SpacebarScraper:
-    def __init__(self, msg_queue):
+    """
+    Business Logic Layer: Handles the web scraping process.
+    """
+    def __init__(self, msg_queue: queue.Queue):
         self.msg_queue = msg_queue
         self.stop_event = threading.Event()
 
-    def log(self, message):
+    def log(self, message: str) -> None:
+        """Sends a log message to the GUI."""
         self.msg_queue.put(("LOG", message))
 
-    def progress(self, value, maximum=None):
+    def progress(self, value: int, maximum: Optional[int] = None) -> None:
+        """Sends a progress update to the GUI."""
         self.msg_queue.put(("PROGRESS", (value, maximum)))
     
-    def status_update(self, message):
+    def status_update(self, message: str) -> None:
+        """Sends a status label update to the GUI."""
         self.msg_queue.put(("STATUS", message))
 
-    def done(self, success, summary):
+    def done(self, success: bool, summary: str) -> None:
+        """Signals completion or failure."""
         self.msg_queue.put(("DONE", (success, summary)))
 
-    def get_normal_news_links(self, soup):
+    def get_normal_news_links(self, soup: BeautifulSoup) -> List[Any]:
+        """Extracts standard article links from the soup object, avoiding highlights if needed."""
         # Remove highlight block to avoid duplicates if necessary
         highlight_header = soup.find("h2", string="เรื่องเด่นประจำวัน")
         if highlight_header:
@@ -60,12 +75,22 @@ class SpacebarScraper:
         news_links = soup.find_all("a", attrs={"aria-label": ["articleLink", "latestArticleLink"]})
         return news_links
 
-    def run(self, category, start_page, end_page, csv_path):
+    def run(self, category: str, start_page: int, end_page: int, csv_path: str) -> None:
+        """
+        Main scraping loop.
+        
+        Args:
+            category: The category slug to scrape.
+            start_page: Page number to start from.
+            end_page: Page number to end at (0 for until end).
+            csv_path: File path to save the CSV.
+        """
         base_url = "https://spacebar.th"
-        articles = []
-        seen_urls = set()
+        articles: List[Dict[str, str]] = []
+        seen_urls: Set[str] = set()
         total_scraped = 0
         page = start_page
+        start_time = time.time()
         
         self.log(f"--- เริ่มต้นดึงข้อมูล: {category} (หน้า {start_page} - {end_page if end_page > 0 else 'จนจบ'}) ---")
         
@@ -79,25 +104,24 @@ class SpacebarScraper:
                         break
 
                     # Update Status
-                    progress_text = f"正在 processing Page {page}..." # Thai text issues in some consoles, using EN for debug safety, change back to Thai in final
                     self.status_update(f"กำลังประมวลผลหน้าที่ {page}...")
                     
                     # Update Progress Bar (Page based)
                     if end_page != 0:
                         self.progress(page - start_page, end_page - start_page + 1)
                     else:
-                        self.progress(0, 0) # Indeterminate
+                        self.progress(0, 0) # Indeterminate mode
 
-                    # Construct URL
+                    # Construct URL safely
                     if page == 1:
-                        category_url = f"{base_url}/category/{category}"
+                        category_url = urljoin(base_url, f"/category/{category}")
                     else:
-                        category_url = f"{base_url}/category/{category}/page/{page}"
+                        category_url = urljoin(base_url, f"/category/{category}/page/{page}")
                     
                     self.log(f"Loading Page: {category_url}")
 
                     try:
-                        resp = session.get(category_url, timeout=15)
+                        resp = session.get(category_url, timeout=20)
                         resp.raise_for_status()
                     except Exception as e:
                         self.log(f"[Error] Failed page {page}: {e}")
@@ -130,9 +154,8 @@ class SpacebarScraper:
                                 headline = headline_tag.get_text(strip=True) if headline_tag else "No Headline"
 
                             # 2. Extract URL
-                            news_url = link.get("href", "")
-                            if news_url.startswith("/"):
-                                news_url = base_url + news_url
+                            raw_url = link.get("href", "")
+                            news_url = urljoin(base_url, raw_url)
                             
                             # Filter
                             if f"/{category}/" not in news_url and not news_url.endswith(f"/{category}"):
@@ -200,14 +223,18 @@ class SpacebarScraper:
                     page += 1
 
             # Save to CSV
+            elapsed = time.time() - start_time
             if articles:
                 df = pd.DataFrame(articles)
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
+                
                 df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-                msg = f"Saved successfully: {csv_path}\nTotal Articles: {total_scraped}"
-                self.log(">>> " + msg.replace("\n", " "))
+                msg = f"Saved successfully: {csv_path}\nTotal Articles: {total_scraped}\nTime: {elapsed:.2f}s"
+                self.log(">>> " + msg.replace("\n", " | "))
                 self.done(True, msg)
             else:
-                msg = "No articles found."
+                msg = f"No articles found.\nTime: {elapsed:.2f}s"
                 self.log(msg)
                 self.done(False, msg)
 
@@ -217,17 +244,20 @@ class SpacebarScraper:
 
 # --- Presentation Layer: GUI (Material Design) ---
 class SpacebarGUI:
+    """
+    Presentation Layer: Controls the GUI and Interaction.
+    """
     def __init__(self):
         # Initialize Window with Material Theme
-        # available themes: cosmo, flatly, journal, lumen, minty, pulse, sand, united, yeti, morph, simplex, cerculean
-        # dark themes: solar, superhero, cyborg, darkly
-        # Switching to 'flatly' as 'materia' caused issues on some systems
-        self.root = ttk.Window(themename="flatly", title=APP_TITLE, size=(550, 750))
+        self.root = ttk.Window(themename="flatly", title=APP_TITLE, size=APP_SIZE)
         self.root.place_window_center()
+        self.root.minsize(580, 780)
         
-        self.msg_queue = queue.Queue()
-        self.scraper_thread = None
-        self.scraper = None
+        self.msg_queue: queue.Queue = queue.Queue()
+        self.scraper_thread: Optional[threading.Thread] = None
+        self.scraper: Optional[SpacebarScraper] = None
+
+        self.last_saved_path: Optional[str] = None
 
         self.build_ui()
         
@@ -298,11 +328,20 @@ class SpacebarGUI:
         self.btn_stop = ttk.Button(action_frame, text="STOP", command=self.stop_task, bootstyle="danger", state="disabled", width=10)
         self.btn_stop.pack(side=LEFT, fill=X, expand=NO, padx=(5, 0))
 
+        # --- Utility Buttons ---
+        util_frame = ttk.Frame(main_frame)
+        util_frame.pack(fill=X, pady=(0, 10))
+        
         # Theme Toggle
-        theme_frame = ttk.Frame(main_frame)
-        theme_frame.pack(fill=X, pady=(0, 10))
-        self.chk_dark = ttk.Checkbutton(theme_frame, text="Dark Mode", bootstyle="round-toggle", command=self.toggle_theme)
-        self.chk_dark.pack(anchor=E)
+        self.chk_dark = ttk.Checkbutton(util_frame, text="Dark Mode", bootstyle="round-toggle", command=self.toggle_theme)
+        self.chk_dark.pack(side=RIGHT)
+
+        # Clear Log
+        ttk.Button(util_frame, text="Clear Log", command=self.clear_log, bootstyle="outline-secondary", width=12).pack(side=LEFT, padx=(0, 5))
+        
+        # Open Folder (Initially disabled)
+        self.btn_open_folder = ttk.Button(util_frame, text="Open Folder", command=self.open_output_folder, bootstyle="outline-info", state="disabled", width=12)
+        self.btn_open_folder.pack(side=LEFT)
 
         # --- Status & Log ---
         self.lbl_status = ttk.Label(main_frame, text="Ready to scrape", font=("Segoe UI", 9), bootstyle="secondary")
@@ -314,27 +353,39 @@ class SpacebarGUI:
         ttk.Label(main_frame, text="System Log", font=("Segoe UI", 9, "bold")).pack(anchor=W)
         
         # Log Text
-        self.log_text = ttk.ScrolledText(main_frame, height=10, state="disabled", font=("Consolas", 9))
+        self.log_text = ttk.ScrolledText(main_frame, height=12, state="disabled", font=("Consolas", 9))
         self.log_text.pack(fill=BOTH, expand=YES)
 
-    def browse_file(self):
+    def browse_file(self) -> None:
         filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="spacebar_news.csv")
         if filename:
             self.path_var.set(filename)
 
-    def toggle_theme(self):
+    def toggle_theme(self) -> None:
         # Toggle between Flatly (Light) and Superhero (Dark)
         current = self.root.style.theme.name
         new_theme = "superhero" if "flatly" in current else "flatly"
         self.root.style.theme_use(new_theme)
+    
+    def clear_log(self) -> None:
+        self.log_text.config(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state="disabled")
 
-    def append_log(self, text):
+    def open_output_folder(self) -> None:
+        if self.last_saved_path and os.path.exists(self.last_saved_path):
+            folder_path = os.path.dirname(os.path.abspath(self.last_saved_path))
+            os.startfile(folder_path)
+        else:
+            Messagebox.show_warning("Folder path not found or file not saved yet.", "Path Error")
+
+    def append_log(self, text: str) -> None:
         self.log_text.config(state="normal")
         self.log_text.insert(tk.END, f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {text}\n")
         self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
 
-    def lock_ui(self, locked):
+    def lock_ui(self, locked: bool) -> None:
         state = "disabled" if locked else "normal"
         readonly = "disabled" if locked else "readonly"
         
@@ -344,8 +395,11 @@ class SpacebarGUI:
         self.cb_category.configure(state=readonly)
         self.btn_start.configure(state=state)
         self.btn_stop.configure(state="normal" if locked else "disabled")
+        # Disable Open Folder while running to prevent confusion, re-enable if valid path exists later
+        if locked:
+           self.btn_open_folder.configure(state="disabled")
 
-    def start_task(self):
+    def start_task(self) -> None:
         # Validation
         try:
             start = int(self.entry_start.get())
@@ -376,13 +430,13 @@ class SpacebarGUI:
         self.scraper_thread = threading.Thread(target=self.scraper.run, args=(cat_slug, start, end, csv_path), daemon=True)
         self.scraper_thread.start()
 
-    def stop_task(self):
+    def stop_task(self) -> None:
         if self.scraper:
             self.scraper.stop_event.set()
             self.append_log(">>> Stopping... please wait")
             self.btn_stop.configure(state="disabled")
 
-    def monitor_queue(self):
+    def monitor_queue(self) -> None:
         try:
             while True:
                 msg_type, data = self.msg_queue.get_nowait()
@@ -406,6 +460,8 @@ class SpacebarGUI:
                     self.lbl_status.config(text="Finished" if success else "Stopped/Error")
                     
                     if success:
+                        self.last_saved_path = self.path_var.get()
+                        self.btn_open_folder.configure(state="normal")
                         ToastNotification(title="Success", message=summary, bootstyle="success", duration=3000).show_toast()
                     else:
                         Messagebox.show_error(summary, "Error")
